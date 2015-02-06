@@ -8,7 +8,8 @@ fs = require "fs"
 path = require "path"
 remote = require "remote"
 temp = require("temp").track()
-{spawn, spawnSync} = require "child_process"
+{startChromedriver} = require("./helpers/chromedriver")
+{spawnSync} = require "child_process"
 {Builder, By} = require "../../build/node_modules/selenium-webdriver"
 
 AtomPath = remote.process.argv[0]
@@ -17,19 +18,21 @@ SocketPath = path.join(os.tmpdir(), "atom-integration-test.sock")
 ChromeDriverPort = 9515
 
 describe "Starting Atom", ->
-  [chromeDriver, driver, tempDirPath] = []
+  [chromedriverProcess, driver, tempDirPath] = []
 
   beforeEach ->
     tempDirPath = temp.mkdirSync("empty-dir")
 
     waitsFor "chromedriver to start", (done) ->
-      chromeDriver = spawn "chromedriver", ["--verbose", "--port=#{ChromeDriverPort}"]
-      chromeDriver.on "error", (error) ->
-        throw new Error("chromedriver failed to start: #{error.message}")
-      chromeDriver.stdout.on "data", -> done()
+      startChromedriver ChromeDriverPort, (process) ->
+        chromedriverProcess = process
+        done()
 
   afterEach ->
-    waitsForPromise -> driver.quit().thenFinally(-> chromeDriver.kill())
+    waitsFor "driver to quit", (done) ->
+      driver.quit().thenFinally ->
+        chromedriverProcess.kill()
+        done()
 
   startAtom = (args...) ->
     driver = new Builder()
@@ -49,9 +52,8 @@ describe "Starting Atom", ->
       .forBrowser('atom')
       .build()
 
-    waitsForPromise ->
-      driver.wait ->
-        driver.getTitle().then (title) -> title.indexOf("Atom") >= 0
+    driver.wait ->
+      driver.getTitle().then (title) -> title.indexOf("Atom") >= 0
 
   startAnotherAtom = (args...) ->
     spawnSync(AtomPath, args.concat([
@@ -60,16 +62,21 @@ describe "Starting Atom", ->
       "--socket-path=#{SocketPath}"
     ]))
 
-  describe "when given the name of a file that doesn't exist", ->
+  wait = (done) -> waitsFor(done, 15000)
+
+  describe "opening paths via commmand-line arguments", ->
     tempFilePath = null
 
     beforeEach ->
       tempFilePath = path.join(tempDirPath, "an-existing-file")
       fs.writeFileSync(tempFilePath, "This was already here.")
-      startAtom(path.join(tempDirPath, "new-file"))
 
-    it "opens a new window with an empty text editor", ->
-      waitsForPromise ->
+    it "reuses existing windows when directories are reopened", ->
+      wait (done) ->
+
+        # Opening a new file creates one window with one empty text editor.
+        startAtom(path.join(tempDirPath, "new-file"))
+
         driver.getAllWindowHandles().then (handles) ->
           expect(handles.length).toBe 1
         driver.executeScript(-> atom.workspace.getActivePane().getItems().length).then (length) ->
@@ -80,28 +87,23 @@ describe "Starting Atom", ->
         driver.executeScript(-> atom.workspace.getActiveTextEditor().getText()).then (text) ->
           expect(text).toBe "Hello world!"
 
-      # Opening another existing file in the same directory reuses the window,
-      # and opens a new tab for the file.
-      waitsForPromise ->
-        startAnotherAtom(tempFilePath)
+        # Opening an existing file in the same directory reuses the window and
+        # adds a new tab for the file.
+        driver.call -> startAnotherAtom(tempFilePath)
         driver.wait ->
           driver.executeScript(-> atom.workspace.getActivePane().getItems().length).then (length) ->
             length is 2
         driver.executeScript(-> atom.workspace.getActiveTextEditor().getText()).then (text) ->
           expect(text).toBe "This was already here."
 
-      # Opening a different directory creates a new window.
-      waitsForPromise ->
-        startAnotherAtom(temp.mkdirSync("another-empty-dir"))
+        # Opening a different directory creates a second window.
+        driver.call -> startAnotherAtom(temp.mkdirSync("another-empty-dir"))
         driver.wait ->
           driver.getAllWindowHandles().then (handles) ->
             handles.length is 2
+        driver.getAllWindowHandles().then (handles) ->
+          driver.switchTo().window(handles[1])
+        driver.executeScript(-> atom.workspace.getActivePane().getItems().length).then (length) ->
+          expect(length).toBe(0)
 
-  describe "when given the name of a directory that exists", ->
-    beforeEach ->
-      startAtom(tempDirPath)
-
-    it "opens a new window no text editors open", ->
-      waitsForPromise ->
-        driver.executeScript(-> atom.workspace.getActiveTextEditor()).then (editor) ->
-          expect(editor).toBeNull()
+        driver.call(done)
